@@ -1,17 +1,21 @@
-from datetime import datetime
+"""Ticket domain model."""
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
-
-from app.database import Base
+from app.models.enums import TicketCategory, TicketPriority, TicketStatus
 
 
-class Ticket(Base):
-    __tablename__ = "tickets"
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    subject: Mapped[str] = mapped_column(String(200), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False)
-    assigned_worker: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+@dataclass
+class Ticket:
+    ticket_id: str
+    title: str
+    description: str
+    priority: TicketPriority
+    category: TicketCategory
+    status: TicketStatus = TicketStatus.OPEN
+    created_at: datetime = field(default_factory=_utc_now)
+    assigned_engineer_id: str | None = None
