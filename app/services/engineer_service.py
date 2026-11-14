@@ -1,74 +1,111 @@
-"""Engineer management and ticket-to-engineer matching.
+"""Engineer management and ticket-to-engineer matching, persisted in SQLite.
 
-Engineers live in a dict keyed by engineer_id, so lookup by ID is O(1)
-on average.
-
-Thread safety: worker threads assign engineers while API threads add them.
-"Is this engineer free? Then mark them busy" must happen as one step, and
-iterating the dict while another thread inserts into it raises RuntimeError.
-queue.Queue cannot protect this dict, so we use one lock.
+Assignment uses optimistic concurrency: pick a candidate, then claim it with
+"UPDATE ... WHERE id = ? AND is_available" and check how many rows changed.
+If another worker claimed it first the UPDATE changes 0 rows and we simply
+try the next candidate. No Python lock is needed.
 """
-import threading
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 
+from app.database import session_scope
 from app.exceptions import (
     DuplicateEngineerError,
     EngineerNotFoundError,
     NoAvailableEngineerError,
 )
-from app.models.engineer import Engineer
+from app.models.engineer import Engineer, EngineerSkill
 from app.models.enums import TicketCategory
 from app.schemas.engineer import EngineerCreate
 
 
 class EngineerService:
-    def __init__(self) -> None:
-        self._engineers: dict[str, Engineer] = {}
-        self._lock = threading.Lock()
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
 
-    def _get(self, engineer_id: str) -> Engineer:
-        # Caller must already hold self._lock.
-        try:
-            return self._engineers[engineer_id]
-        except KeyError:
-            raise EngineerNotFoundError(engineer_id) from None
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
+
+    @staticmethod
+    def _get(session: Session, engineer_id: str) -> Engineer:
+        engineer = session.scalars(
+            select(Engineer)
+            .where(Engineer.engineer_id == engineer_id)
+            .execution_options(populate_existing=True)
+        ).first()
+        if engineer is None:
+            raise EngineerNotFoundError(engineer_id)
+        return engineer
+
+    @staticmethod
+    def _first_available(session: Session, category: TicketCategory) -> Engineer | None:
+        """The earliest-added available engineer with the skill, or None."""
+        return session.scalars(
+            select(Engineer)
+            .join(EngineerSkill, EngineerSkill.engineer_pk == Engineer.id)
+            .where(EngineerSkill.category == category, Engineer.is_available.is_(True))
+            .order_by(Engineer.id)
+            .limit(1)
+        ).first()
 
     def add_engineer(self, data: EngineerCreate) -> Engineer:
-        with self._lock:
-            if data.engineer_id in self._engineers:
-                raise DuplicateEngineerError(data.engineer_id)
+        with session_scope(self._session_factory) as session:
             engineer = Engineer(
                 engineer_id=data.engineer_id,
                 name=data.name,
-                skills=set(data.skills),
                 is_available=data.is_available,
+                skill_rows=[EngineerSkill(category=c) for c in sorted(data.skills)],
             )
-            self._engineers[engineer.engineer_id] = engineer
+            session.add(engineer)
+            try:
+                session.flush()
+            except IntegrityError:
+                raise DuplicateEngineerError(data.engineer_id) from None
             return engineer
 
     def get_engineer(self, engineer_id: str) -> Engineer:
-        with self._lock:
-            return self._get(engineer_id)
+        with session_scope(self._session_factory) as session:
+            return self._get(session, engineer_id)
 
     def list_engineers(self) -> list[Engineer]:
-        with self._lock:
-            return list(self._engineers.values())
+        with session_scope(self._session_factory) as session:
+            return list(session.scalars(select(Engineer).order_by(Engineer.id)))
 
-    def assign_engineer(self, category: TicketCategory) -> Engineer:
-        """Pick the first available engineer with the skill and mark them busy.
+    def assign_engineer(
+        self, category: TicketCategory, *, session: Session | None = None
+    ) -> Engineer:
+        """Reserve the first available engineer with the skill.
 
-        Dicts keep insertion order, so "first" means "added earliest".
-        This is O(E) in the number of engineers. The check and the update
-        happen under one lock, so two workers can never get the same engineer.
+        If the caller passes a session, the reservation joins the caller's
+        transaction, so it is rolled back together with everything else if
+        a later step fails.
         """
-        with self._lock:
-            for engineer in self._engineers.values():
-                if engineer.is_available and category in engineer.skills:
-                    engineer.is_available = False
-                    return engineer
-            raise NoAvailableEngineerError(category)
+        with session_scope(self._session_factory, session) as active:
+            while True:
+                candidate = self._first_available(active, category)
+                if candidate is None:
+                    raise NoAvailableEngineerError(category)
+                claimed = active.execute(
+                    update(Engineer)
+                    .where(Engineer.id == candidate.id, Engineer.is_available.is_(True))
+                    .values(is_available=False)
+                    .execution_options(synchronize_session=False)
+                )
+                if claimed.rowcount == 1:
+                    active.refresh(candidate)  # reload so is_available reads False
+                    return candidate
+                # 0 rows: someone else claimed it first. Look for the next one.
 
     def release_engineer(self, engineer_id: str) -> Engineer:
-        with self._lock:
-            engineer = self._get(engineer_id)
-            engineer.is_available = True
-            return engineer
+        with session_scope(self._session_factory) as session:
+            result = session.execute(
+                update(Engineer)
+                .where(Engineer.engineer_id == engineer_id)
+                .values(is_available=True)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount == 0:
+                raise EngineerNotFoundError(engineer_id)
+            return self._get(session, engineer_id)

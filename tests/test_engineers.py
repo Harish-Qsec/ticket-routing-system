@@ -10,11 +10,13 @@ from app.models.enums import TicketCategory
 
 
 def test_add_and_find_engineer(engineer_service, make_engineer_data):
-    engineer = engineer_service.add_engineer(make_engineer_data())
+    created = engineer_service.add_engineer(make_engineer_data())
+    found = engineer_service.get_engineer("E-1")
 
-    assert engineer_service.get_engineer("E-1") is engineer
-    assert engineer.is_available is True
-    assert engineer.skills == {TicketCategory.NETWORK}
+    assert found.engineer_id == created.engineer_id == "E-1"
+    assert found.is_available is True
+    assert found.skills == {TicketCategory.NETWORK}
+
 
 
 def test_find_missing_engineer_raises(engineer_service):

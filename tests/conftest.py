@@ -1,6 +1,8 @@
-"""Shared fixtures. Each test gets fresh, empty services (no shared state)."""
+"""Shared fixtures. Each test gets its own temporary SQLite database file,
+so tests are isolated from each other and never touch real project data."""
 import pytest
 
+from app.database import create_db_engine, init_db, make_session_factory, sqlite_url
 from app.models.enums import TicketCategory, TicketPriority
 from app.schemas.engineer import EngineerCreate
 from app.schemas.ticket import TicketCreate
@@ -11,13 +13,26 @@ from app.services.ticket_service import TicketService
 
 
 @pytest.fixture
-def ticket_service() -> TicketService:
-    return TicketService()
+def engine(tmp_path):
+    engine = create_db_engine(sqlite_url(tmp_path / "test.db"))
+    init_db(engine)
+    yield engine
+    engine.dispose()  # close connections so Windows can delete the file
 
 
 @pytest.fixture
-def engineer_service() -> EngineerService:
-    return EngineerService()
+def session_factory(engine):
+    return make_session_factory(engine)
+
+
+@pytest.fixture
+def ticket_service(session_factory) -> TicketService:
+    return TicketService(session_factory)
+
+
+@pytest.fixture
+def engineer_service(session_factory) -> EngineerService:
+    return EngineerService(session_factory)
 
 
 @pytest.fixture

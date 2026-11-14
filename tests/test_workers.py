@@ -2,11 +2,15 @@ import threading
 
 import pytest
 
-from app.exceptions import DuplicateTicketError, NoAvailableEngineerError
+from app.exceptions import (
+    DuplicateTicketError,
+    InvalidStatusTransitionError,
+    NoAvailableEngineerError,
+)
 from app.models.enums import TicketCategory, TicketStatus
+from app.services.engineer_service import EngineerService
 from app.services.processing_service import TicketProcessor
 from app.services.worker_service import WorkerPool
-
 
 @pytest.fixture
 def make_pool(processor, queue_service):
@@ -148,7 +152,7 @@ def test_many_tickets_many_workers_no_loss_or_duplicates(
     pool = make_pool(num_workers=8)
 
     pool.start()
-    assert pool.stop(drain=True, timeout=10.0) is True
+    assert pool.stop(drain=True, timeout=30.0) is True
 
     assert_every_ticket_assigned_once(ticket_service, total)
 
@@ -173,7 +177,7 @@ def test_concurrent_submission_from_many_producer_threads(
     for t in threads:
         t.join(timeout=10.0)
 
-    assert pool.stop(drain=True, timeout=10.0) is True
+    assert pool.stop(drain=True, timeout=30.0) is True
     assert_every_ticket_assigned_once(ticket_service, total)
 
 
@@ -202,44 +206,36 @@ def test_concurrent_creates_of_the_same_id_accept_exactly_one(
     assert outcomes.count("duplicate") == attempts - 1
     assert len(ticket_service.list_tickets()) == 1
 
+# ---------- the race condition, now settled by the database ----------
 
-# ---------- the race condition, reproduced on purpose ----------
 
+class RacingEngineerService(EngineerService):
+    """Forces the race: both threads pick the SAME candidate before either
+    one tries to claim it. The barrier lines the two picks up."""
 
-class SlowCheckEngineer:
-    """Test double that forces the race: both threads READ is_available=True
-    before either one WRITES False. The barrier lines the two reads up."""
-
-    def __init__(self, engineer_id, skills):
-        self.engineer_id = engineer_id
-        self.skills = skills
-        self._available = True
+    def __init__(self, session_factory):
+        super().__init__(session_factory)
         self._barrier = threading.Barrier(2)
 
-    @property
-    def is_available(self):
-        value = self._available
+    def _first_available(self, session, category):
+        candidate = super()._first_available(session, category)
         try:
             self._barrier.wait(timeout=0.5)
         except threading.BrokenBarrierError:
-            pass  # the other thread is locked out, so it can never arrive
-        return value
-
-    @is_available.setter
-    def is_available(self, new_value):
-        self._available = new_value
+            pass  # on the retry nobody else is coming, so just carry on
+        return candidate
 
 
-def test_two_threads_can_never_get_the_same_engineer(engineer_service):
-    # Reaching into the private dict is acceptable in a test that needs a double.
-    engineer_service._engineers["E-1"] = SlowCheckEngineer(
-        "E-1", {TicketCategory.NETWORK}
-    )
+def test_two_threads_can_never_get_the_same_engineer(
+    session_factory, make_engineer_data
+):
+    racing = RacingEngineerService(session_factory)
+    racing.add_engineer(make_engineer_data("E-1"))
     outcomes = []
 
     def attempt():
         try:
-            engineer = engineer_service.assign_engineer(TicketCategory.NETWORK)
+            engineer = racing.assign_engineer(TicketCategory.NETWORK)
             outcomes.append(engineer.engineer_id)
         except NoAvailableEngineerError:
             outcomes.append("none")
@@ -248,10 +244,36 @@ def test_two_threads_can_never_get_the_same_engineer(engineer_service):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5.0)
+        t.join(timeout=10.0)
 
     assert sorted(outcomes) == ["E-1", "none"]  # exactly one winner
 
+
+def test_concurrent_submit_of_one_ticket_queues_it_exactly_once(
+    processor, ticket_service, queue_service, make_ticket_data
+):
+    ticket_service.create_ticket(make_ticket_data())
+    attempts = 10
+    barrier = threading.Barrier(attempts)
+    outcomes = []
+
+    def attempt():
+        barrier.wait()
+        try:
+            processor.submit("T-1")
+            outcomes.append("queued")
+        except InvalidStatusTransitionError:
+            outcomes.append("rejected")
+
+    threads = [threading.Thread(target=attempt) for _ in range(attempts)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert outcomes.count("queued") == 1
+    assert outcomes.count("rejected") == attempts - 1
+    assert queue_service.size() == 1
 
 # ---------- worker exception handling ----------
 

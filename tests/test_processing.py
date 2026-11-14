@@ -142,7 +142,7 @@ def test_queue_join_completes_even_when_processing_fails(
 def test_unexpected_error_is_contained_and_ticket_marked_failed(
     processor, ticket_service, engineer_service, make_ticket_data
 ):
-    def explode(category):
+    def explode(category, **kwargs):
         raise RuntimeError("disk on fire")
 
     engineer_service.assign_engineer = explode
@@ -156,10 +156,10 @@ def test_unexpected_error_is_contained_and_ticket_marked_failed(
     assert ticket_service.get_ticket("T-1").status == TicketStatus.FAILED
 
 
-def test_engineer_is_released_if_recording_the_assignment_fails(
+def test_engineer_reservation_is_rolled_back_if_recording_the_assignment_fails(
     processor, ticket_service, engineer_service, make_ticket_data, make_engineer_data
 ):
-    def explode(ticket_id, engineer_id):
+    def explode(ticket_id, engineer_id, **kwargs):
         raise RuntimeError("db write failed")
 
     engineer_service.add_engineer(make_engineer_data("E-1"))

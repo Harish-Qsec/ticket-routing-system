@@ -5,3 +5,8 @@ __pycache__/
 venv/
 .env
 ticket_routing.db
+
+# SQLite write-ahead-log side files and scratch folders
+*.db-wal
+*.db-shm
+_old_scratch/

@@ -27,9 +27,15 @@ class TicketProcessor:
         engineer_service: EngineerService,
         queue_service: QueueService,
     ) -> None:
+        if ticket_service.session_factory is not engineer_service.session_factory:
+            raise ValueError(
+                "TicketService and EngineerService must share one session factory "
+                "so that an assignment can be a single database transaction"
+            )
         self._tickets = ticket_service
         self._engineers = engineer_service
         self._queue = queue_service
+        self._session_factory = ticket_service.session_factory
 
     def submit(self, ticket_id: str) -> Ticket:
         """Mark a ticket QUEUED and put its ID on the queue."""
@@ -44,20 +50,42 @@ class TicketProcessor:
         return ticket
 
     def process_ticket(self, ticket_id: str) -> Ticket:
-        """Assign an engineer to one ticket. Raises on failure, leaving a
-        consistent state (ticket FAILED, no engineer left reserved)."""
+        """Assign an engineer to one ticket.
+
+        Reserving the engineer and recording the assignment happen in ONE
+        database transaction: either both are saved or neither is. On any
+        failure the ticket is marked FAILED and the error is re-raised.
+        """
         # Raises before touching anything if the ticket is not QUEUED.
         self._tickets.update_status(ticket_id, TicketStatus.PROCESSING)
-        engineer = None
         try:
-            ticket = self._tickets.get_ticket(ticket_id)
-            engineer = self._engineers.assign_engineer(ticket.category)
-            return self._tickets.assign_engineer(ticket_id, engineer.engineer_id)
+            with self._session_factory() as session:
+                ticket = self._tickets.get_ticket(ticket_id, session=session)
+                engineer = self._engineers.assign_engineer(
+                    ticket.category, session=session
+                )
+                assigned = self._tickets.assign_engineer(
+                    ticket_id, engineer.engineer_id, session=session
+                )
+                session.commit()  # the single commit point
+            return assigned
         except Exception:
-            if engineer is not None:
-                self._engineers.release_engineer(engineer.engineer_id)
+            # Leaving the "with" block without committing rolled everything
+            # back, so no engineer stays reserved.
             self._tickets.update_status(ticket_id, TicketStatus.FAILED)
             raise
+
+    def restore_queue(self) -> int:
+        """Startup recovery: rebuild the in-memory queue from the database.
+
+        Returns how many tickets were put back on the queue. Order is
+        creation order, which approximates (but is not guaranteed to equal)
+        the original submission order.
+        """
+        ticket_ids = self._tickets.requeue_interrupted()
+        for ticket_id in ticket_ids:
+            self._queue.enqueue(ticket_id)
+        return len(ticket_ids)
 
     def process_next(self, timeout: float | None = None) -> ProcessingResult | None:
         """Process the ticket at the front of the queue.

@@ -26,8 +26,12 @@ def test_create_ticket_sets_defaults(ticket_service, make_ticket_data):
 
 def test_get_ticket_returns_created_ticket(ticket_service, make_ticket_data):
     created = ticket_service.create_ticket(make_ticket_data())
-    assert ticket_service.get_ticket("T-1") is created
+    found = ticket_service.get_ticket("T-1")
 
+    # Each call gets its own session, so these are two separate objects
+    # describing the same row (compare values, not identity).
+    assert found.ticket_id == created.ticket_id
+    assert found.title == created.title
 
 def test_get_missing_ticket_raises(ticket_service):
     with pytest.raises(TicketNotFoundError):
@@ -127,7 +131,10 @@ def test_update_status_of_missing_ticket_raises(ticket_service):
         ticket_service.update_status("nope", TicketStatus.QUEUED)
 
 
-def test_assign_engineer_sets_id_and_status(ticket_service, make_ticket_data):
+def test_assign_engineer_sets_id_and_status(
+    ticket_service, engineer_service, make_ticket_data, make_engineer_data
+):
+    engineer_service.add_engineer(make_engineer_data("E-1"))  # the FK needs a real engineer
     ticket_service.create_ticket(make_ticket_data())
     advance(ticket_service, "T-1", TicketStatus.QUEUED, TicketStatus.PROCESSING)
 
@@ -137,6 +144,20 @@ def test_assign_engineer_sets_id_and_status(ticket_service, make_ticket_data):
     assert ticket.status == TicketStatus.ASSIGNED
 
 
+def test_assign_unknown_engineer_is_rejected_by_the_database(
+    ticket_service, make_ticket_data
+):
+    ticket_service.create_ticket(make_ticket_data())
+    advance(ticket_service, "T-1", TicketStatus.QUEUED, TicketStatus.PROCESSING)
+
+    with pytest.raises(EngineerNotFoundError):
+        ticket_service.assign_engineer("T-1", "ghost")
+
+    ticket = ticket_service.get_ticket("T-1")
+    assert ticket.status == TicketStatus.PROCESSING
+    assert ticket.assigned_engineer_id is None
+
+
 def test_assign_engineer_requires_processing_status(ticket_service, make_ticket_data):
     ticket_service.create_ticket(make_ticket_data())  # still OPEN
 
@@ -144,3 +165,10 @@ def test_assign_engineer_requires_processing_status(ticket_service, make_ticket_
         ticket_service.assign_engineer("T-1", "E-1")
 
     assert ticket_service.get_ticket("T-1").assigned_engineer_id is None
+
+from app.exceptions import (
+    DuplicateTicketError,
+    EngineerNotFoundError,
+    InvalidStatusTransitionError,
+    TicketNotFoundError,
+)
