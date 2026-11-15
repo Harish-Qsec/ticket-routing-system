@@ -74,6 +74,20 @@ class TicketProcessor:
             # back, so no engineer stays reserved.
             self._tickets.update_status(ticket_id, TicketStatus.FAILED)
             raise
+    
+    def resolve_ticket(self, ticket_id: str) -> Ticket:
+        """Mark an ASSIGNED ticket RESOLVED and free its engineer, atomically."""
+        with self._session_factory() as session:
+            ticket = self._tickets.update_status(
+                ticket_id, TicketStatus.RESOLVED, session=session
+            )
+            if ticket.assigned_engineer_id is not None:
+                self._engineers.release_engineer(
+                    ticket.assigned_engineer_id, session=session
+                )
+            session.commit()
+        return ticket
+
 
     def restore_queue(self) -> int:
         """Startup recovery: rebuild the in-memory queue from the database.

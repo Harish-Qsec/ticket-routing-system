@@ -193,3 +193,32 @@ def test_duplicate_queue_entry_is_processed_only_once(
     assert ticket.status == TicketStatus.ASSIGNED
     assert ticket.assigned_engineer_id == "E-1"
     assert engineer_service.get_engineer("E-2").is_available is True
+
+    
+
+def test_resolve_ticket_marks_it_resolved_and_frees_the_engineer(
+    processor, ticket_service, engineer_service, make_ticket_data, make_engineer_data
+):
+    engineer_service.add_engineer(make_engineer_data("E-1"))
+    ticket_service.create_ticket(make_ticket_data())
+    processor.submit("T-1")
+    processor.process_next()
+    assert engineer_service.get_engineer("E-1").is_available is False
+
+    ticket = processor.resolve_ticket("T-1")
+
+    assert ticket.status == TicketStatus.RESOLVED
+    assert engineer_service.get_engineer("E-1").is_available is True
+
+
+def test_resolve_requires_an_assigned_ticket_and_changes_nothing_otherwise(
+    processor, ticket_service, engineer_service, make_ticket_data, make_engineer_data
+):
+    engineer_service.add_engineer(make_engineer_data("E-1", is_available=False))
+    ticket_service.create_ticket(make_ticket_data())  # still OPEN
+
+    with pytest.raises(InvalidStatusTransitionError):
+        processor.resolve_ticket("T-1")
+
+    assert ticket_service.get_ticket("T-1").status == TicketStatus.OPEN
+    assert engineer_service.get_engineer("E-1").is_available is False

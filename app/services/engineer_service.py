@@ -98,9 +98,9 @@ class EngineerService:
                     return candidate
                 # 0 rows: someone else claimed it first. Look for the next one.
 
-    def release_engineer(self, engineer_id: str) -> Engineer:
-        with session_scope(self._session_factory) as session:
-            result = session.execute(
+    def release_engineer(self, engineer_id: str, *, session: Session | None = None) -> Engineer:
+        with session_scope(self._session_factory, session) as active:
+            result = active.execute(
                 update(Engineer)
                 .where(Engineer.engineer_id == engineer_id)
                 .values(is_available=True)
@@ -108,4 +108,4 @@ class EngineerService:
             )
             if result.rowcount == 0:
                 raise EngineerNotFoundError(engineer_id)
-            return self._get(session, engineer_id)
+            return self._get(active, engineer_id)

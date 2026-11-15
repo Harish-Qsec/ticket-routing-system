@@ -111,10 +111,10 @@ class TicketService:
         with session_scope(self._session_factory) as session:
             return list(session.scalars(select(Ticket).order_by(Ticket.id)))
 
-    def update_status(self, ticket_id: str, new_status: TicketStatus) -> Ticket:
-        with session_scope(self._session_factory) as session:
-            self._transition(session, ticket_id, new_status)
-            return self._get(session, ticket_id)
+    def update_status(self, ticket_id: str, new_status: TicketStatus, *, session: Session | None = None) -> Ticket:
+        with session_scope(self._session_factory, session) as active:
+            self._transition(active, ticket_id, new_status)
+            return self._get(active, ticket_id)
 
     def assign_engineer(
         self, ticket_id: str, engineer_id: str, *, session: Session | None = None
