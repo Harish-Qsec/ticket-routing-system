@@ -5,6 +5,8 @@ Assignment uses optimistic concurrency: pick a candidate, then claim it with
 If another worker claimed it first the UPDATE changes 0 rows and we simply
 try the next candidate. No Python lock is needed.
 """
+import logging
+
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -18,6 +20,8 @@ from app.exceptions import (
 from app.models.engineer import Engineer, EngineerSkill
 from app.models.enums import TicketCategory
 from app.schemas.engineer import EngineerCreate
+
+logger = logging.getLogger(__name__)
 
 
 class EngineerService:
@@ -63,7 +67,12 @@ class EngineerService:
                 session.flush()
             except IntegrityError:
                 raise DuplicateEngineerError(data.engineer_id) from None
-            return engineer
+        # The engineer's name is personal data, so only the ID is logged.
+        logger.info(
+            "engineer added: engineer_id=%s skills=%s",
+            engineer.engineer_id, sorted(engineer.skills),
+        )
+        return engineer
 
     def get_engineer(self, engineer_id: str) -> Engineer:
         with session_scope(self._session_factory) as session:
@@ -97,8 +106,14 @@ class EngineerService:
                     active.refresh(candidate)  # reload so is_available reads False
                     return candidate
                 # 0 rows: someone else claimed it first. Look for the next one.
+                logger.debug(
+                    "engineer_id=%s was claimed by another worker; trying the next",
+                    candidate.engineer_id,
+                )
 
-    def release_engineer(self, engineer_id: str, *, session: Session | None = None) -> Engineer:
+    def release_engineer(
+        self, engineer_id: str, *, session: Session | None = None
+    ) -> Engineer:
         with session_scope(self._session_factory, session) as active:
             result = active.execute(
                 update(Engineer)

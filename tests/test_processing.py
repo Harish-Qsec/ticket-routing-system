@@ -5,9 +5,12 @@ from app.exceptions import (
     QueueFullError,
     TicketNotFoundError,
 )
-from app.models.enums import TicketStatus
+from app.database import create_db_engine, init_db, make_session_factory, sqlite_url
+from app.models.enums import TicketPriority, TicketStatus
+from app.services.engineer_service import EngineerService
 from app.services.processing_service import TicketProcessor
 from app.services.queue_service import QueueService
+from app.services.ticket_service import TicketService
 from tests.helpers import joins_within
 
 
@@ -222,3 +225,53 @@ def test_resolve_requires_an_assigned_ticket_and_changes_nothing_otherwise(
 
     assert ticket_service.get_ticket("T-1").status == TicketStatus.OPEN
     assert engineer_service.get_engineer("E-1").is_available is False
+
+
+
+def test_process_next_with_a_timeout_returns_none_when_idle(processor):
+    assert processor.process_next(timeout=0.01) is None
+
+
+def test_queue_order_ignores_priority_by_design(
+    processor, ticket_service, engineer_service, make_ticket_data, make_engineer_data
+):
+    engineer_service.add_engineer(make_engineer_data("E-1"))
+    engineer_service.add_engineer(make_engineer_data("E-2"))
+    ticket_service.create_ticket(make_ticket_data("LOW-1", priority=TicketPriority.LOW))
+    ticket_service.create_ticket(
+        make_ticket_data("CRIT-1", priority=TicketPriority.CRITICAL)
+    )
+    processor.submit("LOW-1")
+    processor.submit("CRIT-1")
+
+    # A plain FIFO queue serves first-come first-served, urgent or not.
+    assert processor.process_next().ticket_id == "LOW-1"
+    assert processor.process_next().ticket_id == "CRIT-1"
+
+
+def test_processor_rejects_services_that_use_different_databases(
+    session_factory, tmp_path, queue_service
+):
+    other_engine = create_db_engine(sqlite_url(tmp_path / "other.db"))
+    try:
+        init_db(other_engine)
+        tickets = TicketService(session_factory)
+        engineers = EngineerService(make_session_factory(other_engine))
+
+        with pytest.raises(ValueError):
+            TicketProcessor(tickets, engineers, queue_service)
+    finally:
+        other_engine.dispose()    
+
+
+
+def test_resolving_a_ticket_that_has_no_engineer_still_works(
+    processor, ticket_service, make_ticket_data
+):
+    ticket_service.create_ticket(make_ticket_data())
+    for status in (TicketStatus.QUEUED, TicketStatus.PROCESSING, TicketStatus.ASSIGNED):
+        ticket_service.update_status("T-1", status)  # ASSIGNED with no engineer
+
+    ticket = processor.resolve_ticket("T-1")
+
+    assert ticket.status == TicketStatus.RESOLVED

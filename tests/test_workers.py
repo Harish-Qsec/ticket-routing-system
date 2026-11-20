@@ -1,4 +1,6 @@
+import logging
 import threading
+
 
 import pytest
 
@@ -11,6 +13,9 @@ from app.models.enums import TicketCategory, TicketStatus
 from app.services.engineer_service import EngineerService
 from app.services.processing_service import TicketProcessor
 from app.services.worker_service import WorkerPool
+
+pytestmark = pytest.mark.concurrency  # every test in this file starts threads
+
 
 @pytest.fixture
 def make_pool(processor, queue_service):
@@ -111,7 +116,7 @@ def test_workers_really_run_concurrently(
     The barrier only opens when 3 threads are waiting at it together, so a
     single-threaded consumer would time out and fail this test.
     """
-    barrier = threading.Barrier(3, timeout=2.0)
+    barrier = threading.Barrier(3, timeout=5.0)
     thread_names = []
 
     class BarrierProcessor(TicketProcessor):
@@ -206,6 +211,7 @@ def test_concurrent_creates_of_the_same_id_accept_exactly_one(
     assert outcomes.count("duplicate") == attempts - 1
     assert len(ticket_service.list_tickets()) == 1
 
+
 # ---------- the race condition, now settled by the database ----------
 
 
@@ -216,13 +222,13 @@ class RacingEngineerService(EngineerService):
     def __init__(self, session_factory):
         super().__init__(session_factory)
         self._barrier = threading.Barrier(2)
+        self._seen = threading.local()
 
     def _first_available(self, session, category):
         candidate = super()._first_available(session, category)
-        try:
-            self._barrier.wait(timeout=0.5)
-        except threading.BrokenBarrierError:
-            pass  # on the retry nobody else is coming, so just carry on
+        if not getattr(self._seen, "waited", False):
+            self._seen.waited = True  # only each thread's FIRST pick waits
+            self._barrier.wait(timeout=5.0)  # if the partner never comes: fail loudly
         return candidate
 
 
@@ -275,6 +281,7 @@ def test_concurrent_submit_of_one_ticket_queues_it_exactly_once(
     assert outcomes.count("rejected") == attempts - 1
     assert queue_service.size() == 1
 
+
 # ---------- worker exception handling ----------
 
 
@@ -303,6 +310,30 @@ def test_worker_survives_an_unexpected_error_and_keeps_processing(
     assert ticket_service.get_ticket("T-1").status == TicketStatus.ASSIGNED
 
 
+def test_worker_survives_a_malformed_result_and_keeps_processing(
+    make_pool, processor, ticket_service, engineer_service,
+    make_ticket_data, make_engineer_data,
+):
+    original = processor.process_next
+    calls = {"count": 0}
+
+    def malformed_then_real(timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return object()  # no .success attribute: inspecting it raises
+        return original(timeout=timeout)
+
+    processor.process_next = malformed_then_real
+    add_engineers(engineer_service, make_engineer_data, 1)
+    add_and_submit_tickets(ticket_service, processor, make_ticket_data, ["T-1"])
+    pool = make_pool(num_workers=1)
+
+    pool.start()
+    assert pool.stop(drain=True, timeout=5.0) is True
+
+    assert ticket_service.get_ticket("T-1").status == TicketStatus.ASSIGNED
+
+
 def test_a_failing_ticket_does_not_stop_the_pool(
     make_pool, processor, ticket_service, engineer_service,
     make_ticket_data, make_engineer_data,
@@ -320,3 +351,124 @@ def test_a_failing_ticket_does_not_stop_the_pool(
     assert ticket_service.get_ticket("BAD").status == TicketStatus.FAILED
     assert ticket_service.get_ticket("T-1").status == TicketStatus.ASSIGNED
     assert ticket_service.get_ticket("T-2").status == TicketStatus.ASSIGNED
+
+
+# ---------- shutdown paths ----------
+
+
+class StuckProcessor(TicketProcessor):
+    """Blocks inside process_ticket until released, to exercise shutdown paths."""
+
+    def __init__(self, *args, entered, release, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._entered = entered
+        self._release = release
+
+    def process_ticket(self, ticket_id):
+        self._entered.set()
+        self._release.wait(timeout=10.0)
+        return super().process_ticket(ticket_id)
+
+
+def test_stop_reports_failure_while_a_worker_is_stuck_then_succeeds_once_released(
+    ticket_service, engineer_service, queue_service,
+    make_ticket_data, make_engineer_data,
+):
+    entered, release = threading.Event(), threading.Event()
+    stuck = StuckProcessor(
+        ticket_service, engineer_service, queue_service,
+        entered=entered, release=release,
+    )
+    add_engineers(engineer_service, make_engineer_data, 1)
+    add_and_submit_tickets(ticket_service, stuck, make_ticket_data, ["T-1"])
+    pool = WorkerPool(stuck, queue_service, 1, poll_timeout=0.02)
+
+    pool.start()
+    try:
+        assert entered.wait(timeout=5.0)  # the worker is now stuck inside T-1
+        assert pool.stop(drain=True, timeout=0.3) is False  # cannot drain or join
+        assert pool.is_running is True
+    finally:
+        release.set()
+
+    assert pool.stop(drain=True, timeout=5.0) is True
+    assert ticket_service.get_ticket("T-1").status == TicketStatus.ASSIGNED
+
+
+def test_stop_without_drain_leaves_waiting_tickets_queued(
+    ticket_service, engineer_service, queue_service,
+    make_ticket_data, make_engineer_data,
+):
+    entered, release = threading.Event(), threading.Event()
+    stuck = StuckProcessor(
+        ticket_service, engineer_service, queue_service,
+        entered=entered, release=release,
+    )
+    add_engineers(engineer_service, make_engineer_data, 2)
+    add_and_submit_tickets(ticket_service, stuck, make_ticket_data, ["T-1", "T-2"])
+    pool = WorkerPool(stuck, queue_service, 1, poll_timeout=0.02)
+
+    pool.start()
+    try:
+        assert entered.wait(timeout=5.0)
+        assert pool.stop(drain=False, timeout=0.3) is False  # still stuck on T-1
+    finally:
+        release.set()
+    assert pool.stop(drain=False, timeout=5.0) is True
+
+    assert ticket_service.get_ticket("T-1").status == TicketStatus.ASSIGNED
+    assert ticket_service.get_ticket("T-2").status == TicketStatus.QUEUED
+    assert queue_service.size() == 1
+
+
+def test_pool_can_be_started_again_after_a_clean_stop(
+    make_pool, processor, ticket_service, engineer_service,
+    make_ticket_data, make_engineer_data,
+):
+    add_engineers(engineer_service, make_engineer_data, 2)
+    pool = make_pool(num_workers=2)
+    pool.start()
+    assert pool.stop() is True
+
+    add_and_submit_tickets(ticket_service, processor, make_ticket_data, ["T-1"])
+    pool.start()
+    assert pool.stop(drain=True, timeout=5.0) is True
+
+    assert ticket_service.get_ticket("T-1").status == TicketStatus.ASSIGNED
+
+
+@pytest.mark.parametrize("bad_timeout", [0, -0.5])
+def test_invalid_poll_timeout_is_rejected(processor, queue_service, bad_timeout):
+    with pytest.raises(ValueError):
+        WorkerPool(processor, queue_service, poll_timeout=bad_timeout)
+
+
+
+def test_a_worker_error_is_logged_with_a_traceback(
+    caplog, make_pool, processor, ticket_service, engineer_service,
+    make_ticket_data, make_engineer_data,
+):
+    caplog.set_level(logging.DEBUG, logger="app")
+    original = processor.process_next
+    calls = {"count": 0}
+
+    def flaky(timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("boom")
+        return original(timeout=timeout)
+
+    processor.process_next = flaky
+    add_engineers(engineer_service, make_engineer_data, 1)
+    add_and_submit_tickets(ticket_service, processor, make_ticket_data, ["T-1"])
+    pool = make_pool(num_workers=1)
+
+    pool.start()
+    assert pool.stop(drain=True, timeout=5.0) is True  # drain waits until T-1 is done
+
+    errors = [
+        r for r in caplog.records
+        if r.name == "app.services.worker_service" and r.levelno == logging.ERROR
+    ]
+    assert errors
+    assert errors[0].exc_info is not None

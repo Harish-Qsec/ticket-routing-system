@@ -1,3 +1,4 @@
+import threading
 import pytest
 
 from app.exceptions import QueueFullError
@@ -73,3 +74,19 @@ def test_join_with_timeout_returns_false_while_work_is_unfinished(queue_service)
 
     queue_service.task_done()
     assert queue_service.join(timeout=0.05) is True
+
+
+
+def test_dequeue_with_timeout_returns_an_item_that_is_already_waiting(queue_service):
+    queue_service.enqueue("T-1")
+
+    assert queue_service.dequeue(timeout=1.0) == "T-1"
+
+
+def test_a_blocked_dequeue_wakes_up_when_an_item_arrives(queue_service):
+    timer = threading.Timer(0.05, queue_service.enqueue, args=("T-1",))
+    timer.start()
+    try:
+        assert queue_service.dequeue(timeout=5.0) == "T-1"
+    finally:
+        timer.cancel()

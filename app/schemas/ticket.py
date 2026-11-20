@@ -4,6 +4,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.enums import TicketCategory, TicketPriority, TicketStatus
+from app.schemas.common import ID_PATTERN
 
 # Statuses a client may ask for. Everything else belongs to the pipeline:
 # QUEUED/FAILED are set through POST /tickets/{id}/process, and
@@ -14,7 +15,7 @@ CLIENT_SETTABLE_STATUSES = frozenset({TicketStatus.RESOLVED})
 class TicketCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    ticket_id: str = Field(min_length=1, max_length=50)
+    ticket_id: str = Field(min_length=1, max_length=50, pattern=ID_PATTERN)
     title: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=2000)
     priority: TicketPriority

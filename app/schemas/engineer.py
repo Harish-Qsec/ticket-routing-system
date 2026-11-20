@@ -2,12 +2,13 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.enums import TicketCategory
+from app.schemas.common import ID_PATTERN
 
 
 class EngineerCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    engineer_id: str = Field(min_length=1, max_length=50)
+    engineer_id: str = Field(min_length=1, max_length=50, pattern=ID_PATTERN)
     name: str = Field(min_length=1, max_length=100)
     skills: set[TicketCategory] = Field(min_length=1)
     is_available: bool = True

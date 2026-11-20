@@ -112,3 +112,32 @@ def test_release_makes_engineer_assignable_again(engineer_service, make_engineer
 def test_release_missing_engineer_raises(engineer_service):
     with pytest.raises(EngineerNotFoundError):
         engineer_service.release_engineer("nope")
+
+
+
+def test_name_length_boundary(make_engineer_data):
+    make_engineer_data(name="n" * 100)  # accepted
+
+    with pytest.raises(ValidationError):
+        make_engineer_data(name="n" * 101)
+
+
+def test_engineer_with_every_skill_can_be_assigned_for_each_category(
+    engineer_service, make_engineer_data
+):
+    engineer_service.add_engineer(make_engineer_data("E-1", skills=set(TicketCategory)))
+
+    for category in TicketCategory:
+        assert engineer_service.assign_engineer(category).engineer_id == "E-1"
+        engineer_service.release_engineer("E-1")
+
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["E 1", "E/1", "E-1\nFORGED", "E-1;DROP", "\u00e9ngineer"],
+    ids=["space", "slash", "newline", "semicolon", "non-ascii"],
+)
+def test_engineer_ids_with_unsafe_characters_are_rejected(make_engineer_data, bad_id):
+    with pytest.raises(ValidationError):
+        make_engineer_data(bad_id)

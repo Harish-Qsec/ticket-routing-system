@@ -40,6 +40,7 @@ class WorkerPool:
         if self._threads:
             raise RuntimeError("WorkerPool is already started")
         self._stop_event.clear()
+        logger.info("starting %d worker(s)", self._num_workers)
         for number in range(1, self._num_workers + 1):
             thread = threading.Thread(
                 target=self._worker_loop,
@@ -78,12 +79,13 @@ class WorkerPool:
                 # Blocks up to poll_timeout, then returns None so we can
                 # re-check the stop flag.
                 result = self._processor.process_next(timeout=self._poll_timeout)
+                if result is not None:
+                    # Failures are logged where they happen (TicketProcessor).
+                    logger.debug(
+                        "%s handled ticket_id=%s success=%s",
+                        name, result.ticket_id, result.success,
+                    )
             except Exception:
                 logger.exception("%s hit an unexpected error; continuing", name)
                 self._stop_event.wait(0.05)  # brief back-off, no hot loop
-                continue
-            if result is not None and not result.success:
-                logger.warning(
-                    "%s: ticket %s failed: %s", name, result.ticket_id, result.error
-                )
         logger.info("%s stopped", name)

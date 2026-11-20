@@ -2,15 +2,20 @@
 
 No threads here. In Phase 4 worker threads simply call process_next() in a
 loop, so the same logic is tested single-threaded first.
+
+Logging rule: only identifiers and counts, never ticket text or names.
 """
+import logging
 from dataclasses import dataclass
 
-from app.exceptions import QueueFullError
+from app.exceptions import QueueFullError, TicketSystemError
 from app.models.enums import TicketStatus
 from app.models.ticket import Ticket
 from app.services.engineer_service import EngineerService
 from app.services.queue_service import QueueService
 from app.services.ticket_service import TicketService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,11 @@ class TicketProcessor:
             self._queue.enqueue(ticket_id)
         except QueueFullError:
             self._tickets.update_status(ticket_id, TicketStatus.FAILED)
+            logger.warning("queue is full: ticket_id=%s marked FAILED", ticket_id)
             raise
+        logger.info(
+            "ticket queued: ticket_id=%s queue_size=%d", ticket_id, self._queue.size()
+        )
         return ticket
 
     def process_ticket(self, ticket_id: str) -> Ticket:
@@ -68,13 +77,17 @@ class TicketProcessor:
                     ticket_id, engineer.engineer_id, session=session
                 )
                 session.commit()  # the single commit point
+            logger.info(
+                "ticket assigned: ticket_id=%s engineer_id=%s",
+                ticket_id, engineer.engineer_id,
+            )
             return assigned
         except Exception:
             # Leaving the "with" block without committing rolled everything
             # back, so no engineer stays reserved.
             self._tickets.update_status(ticket_id, TicketStatus.FAILED)
             raise
-    
+
     def resolve_ticket(self, ticket_id: str) -> Ticket:
         """Mark an ASSIGNED ticket RESOLVED and free its engineer, atomically."""
         with self._session_factory() as session:
@@ -86,8 +99,11 @@ class TicketProcessor:
                     ticket.assigned_engineer_id, session=session
                 )
             session.commit()
+        logger.info(
+            "ticket resolved: ticket_id=%s engineer_released=%s",
+            ticket_id, ticket.assigned_engineer_id is not None,
+        )
         return ticket
-
 
     def restore_queue(self) -> int:
         """Startup recovery: rebuild the in-memory queue from the database.
@@ -99,6 +115,7 @@ class TicketProcessor:
         ticket_ids = self._tickets.requeue_interrupted()
         for ticket_id in ticket_ids:
             self._queue.enqueue(ticket_id)
+        logger.info("queue restored: %d ticket(s) re-enqueued", len(ticket_ids))
         return len(ticket_ids)
 
     def process_next(self, timeout: float | None = None) -> ProcessingResult | None:
@@ -119,6 +136,16 @@ class TicketProcessor:
             self.process_ticket(ticket_id)
             return ProcessingResult(ticket_id, success=True)
         except Exception as exc:  # deliberate: the consumer must survive
+            if isinstance(exc, TicketSystemError):
+                # An expected business failure, such as "no engineer available".
+                logger.warning(
+                    "ticket processing failed: ticket_id=%s reason=%s", ticket_id, exc
+                )
+            else:
+                # A bug or an infrastructure problem: keep the full traceback.
+                logger.error(
+                    "ticket processing crashed: ticket_id=%s", ticket_id, exc_info=True
+                )
             return ProcessingResult(ticket_id, success=False, error=str(exc))
         finally:
             # Exactly once per successful dequeue, success or failure.

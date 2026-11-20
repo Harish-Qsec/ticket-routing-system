@@ -1,6 +1,6 @@
 import pytest
 from pydantic import ValidationError
-
+from app.models.enums import TicketCategory, TicketPriority, TicketStatus
 from app.exceptions import (
     DuplicateTicketError,
     InvalidStatusTransitionError,
@@ -172,3 +172,51 @@ from app.exceptions import (
     InvalidStatusTransitionError,
     TicketNotFoundError,
 )
+
+
+def test_longest_allowed_values_are_accepted(make_ticket_data):
+    data = make_ticket_data("x" * 50, title="t" * 200, description="d" * 2000)
+
+    assert len(data.ticket_id) == 50
+    assert len(data.title) == 200
+    assert len(data.description) == 2000
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"ticket_id": "x" * 51}, {"description": "d" * 2001}],
+    ids=["id-too-long", "description-too-long"],
+)
+def test_values_one_character_too_long_are_rejected(make_ticket_data, overrides):
+    with pytest.raises(ValidationError):
+        make_ticket_data(**overrides)
+
+
+def test_surrounding_whitespace_is_stripped(ticket_service, make_ticket_data):
+    ticket = ticket_service.create_ticket(
+        make_ticket_data(title="  VPN down  ", description="\tno access\n")
+    )
+
+    assert ticket.title == "VPN down"
+    assert ticket.description == "no access"
+
+
+def test_every_priority_and_category_is_accepted(make_ticket_data):
+    for priority in TicketPriority:
+        for category in TicketCategory:
+            make_ticket_data(priority=priority, category=category)  # must not raise
+
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["T 1", "T/1", "T-1\nFORGED", "T-1;DROP", "t\u00efcket"],
+    ids=["space", "slash", "newline", "semicolon", "non-ascii"],
+)
+def test_ticket_ids_with_unsafe_characters_are_rejected(make_ticket_data, bad_id):
+    with pytest.raises(ValidationError):
+        make_ticket_data(bad_id)
+
+
+def test_ticket_ids_may_use_letters_digits_dot_underscore_and_hyphen(make_ticket_data):
+    assert make_ticket_data("Abc_1.2-Z").ticket_id == "Abc_1.2-Z"

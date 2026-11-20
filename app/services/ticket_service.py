@@ -5,6 +5,7 @@ Concurrency is handled by the database, not by Python locks:
   * status changes are one conditional UPDATE ("compare-and-set"), so two
     threads can never both move the same ticket through the same transition.
 """
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
@@ -21,6 +22,8 @@ from app.exceptions import (
 from app.models.enums import TicketStatus
 from app.models.ticket import Ticket
 from app.schemas.ticket import TicketCreate
+
+logger = logging.getLogger(__name__)
 
 # Which status changes are legal. Anything not listed is rejected.
 ALLOWED_TRANSITIONS: dict[TicketStatus, frozenset[TicketStatus]] = {
@@ -101,7 +104,13 @@ class TicketService:
                 session.flush()  # sends the INSERT now, so a duplicate fails here
             except IntegrityError:
                 raise DuplicateTicketError(data.ticket_id) from None
-            return ticket
+        # Logged after the commit. Only identifiers and enums: the title and
+        # description are free text and may contain secrets, so never log them.
+        logger.info(
+            "ticket created: ticket_id=%s priority=%s category=%s",
+            ticket.ticket_id, ticket.priority, ticket.category,
+        )
+        return ticket
 
     def get_ticket(self, ticket_id: str, *, session: Session | None = None) -> Ticket:
         with session_scope(self._session_factory, session) as active:
@@ -111,7 +120,9 @@ class TicketService:
         with session_scope(self._session_factory) as session:
             return list(session.scalars(select(Ticket).order_by(Ticket.id)))
 
-    def update_status(self, ticket_id: str, new_status: TicketStatus, *, session: Session | None = None) -> Ticket:
+    def update_status(
+        self, ticket_id: str, new_status: TicketStatus, *, session: Session | None = None
+    ) -> Ticket:
         with session_scope(self._session_factory, session) as active:
             self._transition(active, ticket_id, new_status)
             return self._get(active, ticket_id)

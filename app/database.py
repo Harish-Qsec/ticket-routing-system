@@ -3,7 +3,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timezone
 from pathlib import Path
-
+from sqlalchemy import DateTime, Enum, create_engine, event, inspect
 from sqlalchemy import DateTime, Enum, create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -55,7 +55,11 @@ def create_db_engine(database_url: str) -> Engine:
         # thread at a time, so sharing connections across threads is safe.
         # timeout: wait up to 30 s for another writer instead of failing.
         connect_args = {"check_same_thread": False, "timeout": 30}
-    engine = create_engine(database_url, connect_args=connect_args)
+    # hide_parameters=True: error messages show the SQL but never the values
+    # bound to it (ticket titles and descriptions could otherwise leak into logs).
+    engine = create_engine(
+        database_url, connect_args=connect_args, hide_parameters=True
+    )
 
     if is_sqlite:
 
@@ -76,6 +80,24 @@ def make_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
+def check_schema(engine: Engine) -> None:
+    """Fail clearly if an existing database was made by an older version.
+
+    create_all() never alters existing tables, so an outdated file would
+    otherwise fail later with a confusing 'no such column' error.
+    """
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        existing = {column["name"] for column in inspector.get_columns(table.name)}
+        missing = {column.name for column in table.columns} - existing
+        if missing:
+            raise RuntimeError(
+                f"Table '{table.name}' in the database is missing columns "
+                f"{sorted(missing)}. The file was made by an older version of "
+                "the app: delete it (development) or migrate it."
+            )
+
+
 def init_db(engine: Engine) -> None:
     """Create all tables (safe to call repeatedly)."""
     # Importing the model modules registers their tables on Base.metadata.
@@ -83,7 +105,7 @@ def init_db(engine: Engine) -> None:
     import app.models.ticket  # noqa: F401
 
     Base.metadata.create_all(engine)
-
+    check_schema(engine)
 
 @contextmanager
 def session_scope(

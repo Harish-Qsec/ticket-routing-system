@@ -1,5 +1,7 @@
 """Shared fixtures. Each test gets its own temporary SQLite database file,
 so tests are isolated from each other and never touch real project data."""
+import logging
+
 import pytest
 
 from app.database import create_db_engine, init_db, make_session_factory, sqlite_url
@@ -10,6 +12,28 @@ from app.services.engineer_service import EngineerService
 from app.services.processing_service import TicketProcessor
 from app.services.queue_service import QueueService
 from app.services.ticket_service import TicketService
+
+
+@pytest.fixture(autouse=True)
+def restore_app_logger():
+    """configure_logging() changes global state; undo it after every test."""
+    logger = logging.getLogger("app")
+    saved = (logger.level, list(logger.handlers), logger.propagate)
+    yield
+    logger.setLevel(saved[0])
+    logger.handlers[:] = saved[1]
+    logger.propagate = saved[2]
+
+
+@pytest.fixture(autouse=True)
+def isolated_environment(tmp_path, monkeypatch):
+    """Whatever a test does, it must never touch the real project database.
+
+    Relative paths (such as the default ./ticket_routing.db) now resolve inside
+    the test's temporary folder, and the default database URL points there too.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TICKETS_DATABASE_URL", sqlite_url(tmp_path / "default.db"))
 
 
 @pytest.fixture
